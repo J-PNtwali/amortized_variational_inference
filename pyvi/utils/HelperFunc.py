@@ -93,13 +93,14 @@ class MultivariateGaussianMDN(nn.Module):
         The neural network does not output the Cholesky factors directly but rather tensors containing their respective lower diagonal elements.
 
     '''
-    def __init__(self, input_size:int, dim:int=2, K:int=1, hd:int=64, sort=False):
+    def __init__(self, input_size:int, dim:int=2, K:int=1, hd:int=64, num_hidden=1, sort=False):
         '''
             Input: 
                 * input_size: dimension of the input to the neural net, i.e. the number of elements in the observation vector yobs
                 * dim:        dimension of the posterior distribution. This is in general the number of parameters in the model.
                 * K:          number of mixture components
-                * hd:     dimension of hidden layers
+                * hd:         dimension of each hidden layer
+                * num_hidden: number of hidden layers
             Output:
                 * mean: tensor of dimensions batchsize X k X dim containing the predicted means
                 * chol: tensor of appropriate dimensions containing the the predicted Cholesky factors
@@ -110,18 +111,15 @@ class MultivariateGaussianMDN(nn.Module):
         self.dim = dim
         self.K = K
         self.hd = hd
+        self.num_hidden = num_hidden
         self.sort = sort
 
-        self.hidden = nn.Sequential(          # hidden layers
-            nn.Linear(input_size, self.hd),
-            nn.ELU(),
-            nn.Linear(self.hd, self.hd),
-            nn.ELU(),
-            # nn.Linear(self.hd, self.hd),
-            # nn.ELU(),
-            nn.Linear(self.hd, self.hd),
-            nn.ELU()
-        )
+        # input layer
+        self.input_layer = nn.Sequential(nn.Linear(input_size, hd), nn.ELU())
+        # hidden layers
+        self.hidden_layers = nn.ModuleList([
+            nn.Sequential(nn.Linear(hd, hd), nn.ELU()) for _ in range(num_hidden) 
+            ])
         
         # means of each component
         self.mean = nn.Linear(self.hd, self.K * self.dim)
@@ -138,8 +136,13 @@ class MultivariateGaussianMDN(nn.Module):
     def forward(self, x):
         if self.sort:
             x = x.sort().values
+        # input layer
+        x = self.input_layer(x)
 
-        x = self.hidden(x)
+        # hidden layers
+        for layer in self.hidden_layers:
+            x = layer(x)
+
         # mean
         mean = self.mean(x)
         mean = mean.reshape((mean.shape[0], self.K, self.dim))
