@@ -164,8 +164,8 @@ class MultivariateGaussianMDN(nn.Module):
 ################################################################################################################
 #        simulation-based calibration checks --- plotting
 ################################################################################################################
-def sbc_gaussian(gmmnet, proposal, generator, sample_size=20, n_sim = 1e+4, ecdf=True, ecdf_diff=False, 
-                 logscale=None, figsize=(12,4), dpi=100):
+def sbc_plot(gmmnet, proposal, generator, sample_size=1, n_sim = 1e+4, ecdf=True, ecdf_diff=False, logscale=None,
+                  logitscale=None, labels=None, figsize=(12, 4), dpi=100):
     '''
     Perform simulation-based calibration check for a Gaussian mixture network for posterior approximation
 
@@ -188,24 +188,27 @@ def sbc_gaussian(gmmnet, proposal, generator, sample_size=20, n_sim = 1e+4, ecdf
         
         -- logscale: (iterable) contains dimensions of the model parameter vector `theta` that are on log-scale
                         note: we use the standard Python counting, starting at 0
+        -- logitscale: (iterable) contains dimensions of the model parameter vector `theta` that are on logit-scale
+                        note: we use the standard Python counting, starting at 0
 
     Note: 95% confidence intervals are based on the  Dvoretzky–Kiefer–Wolfowitz inequality (see https://en.wikipedia.org/wiki/Empirical_distribution_function, accessed: 20-05-2024)
     
     Output: SBC plot as a Pyplot figure
     '''
-
     # draw samples from the prior/proposal  theta ~ p(theta)
     Theta = proposal.sample((n_sim,))
 
     # draw samples from the model x ~ p(x|theta)
     simulator = generator(Theta)
     X = simulator.sample((sample_size,))
-    
+
     # ensure all dimensions are on the right scale
     if logscale:
         for i in logscale:
-            Theta[:,i] = Theta[:,i].log()     # put sigma2 on logscale
-
+            Theta[...,i].log_()
+    if logitscale:
+        for i in logitscale:
+            Theta[...,i].logit_()
     
     # run the gmmnet
     with torch.no_grad():
@@ -221,101 +224,60 @@ def sbc_gaussian(gmmnet, proposal, generator, sample_size=20, n_sim = 1e+4, ecdf
 
     # calculate covariance matrices
     covariance = torch.linalg.inv(precision) 
-
-    # define GMM variational marginal distributions and calculate cdf values for the true parameter values
-    W = torch.zeros((n_sim, dim))   # tensor of cdf values
     
+    fig = plt.figure(figsize=figsize, dpi=dpi)
+
     for j in range(dim):
+        # define GMM variational marginal distributions and calculate cdf values for the true parameter values
+
         # mixture weights
-        mix = D.Categorical(coeff)
+        mix = torch.distributions.Categorical(coeff)
         # mixture components
-        comp = D.Normal(mean[:,:,j], torch.sqrt(covariance[:,:,j,j]))
+        comp = torch.distributions.Normal(mean[:,:,j], torch.sqrt(covariance[:,:,j,j]))
         # define the mixture
-        gmm = D.MixtureSameFamily(mix, comp) if n_component > 1 else comp
+        gmm = torch.distributions.MixtureSameFamily(mix, comp) if n_component > 1 else torch.distributions.Normal(mean[:,:,j].squeeze(), torch.sqrt(covariance[:,:,j,j]).squeeze())
         # evaluate cdf
-        W[:,j] = gmm.cdf(Theta[:,j].to(device))
+        w = gmm.cdf(Theta[:,j].to(device)).cpu().squeeze()
 
+        if ecdf:
+            #=====================================================
+            # ECDF plot
+            #=====================================================
+            # Calculate the empirical cumulative distribution function (ECDF)
+            eCDF = torch.arange(1, n_sim + 1) / n_sim
 
-    if ecdf:
-        #=====================================================
-        # ECDF plot
-        #=====================================================
-        fig = plt.figure(figsize=figsize, dpi=dpi)
+            # calculate 95% confidence intervals for the eCDF
+            eps = np.sqrt(np.log(2 / 0.05) / (2 * n_sim))
+            eCDF_lower, eCDF_upper = eCDF - eps, eCDF + eps
 
-        # Calculate the empirical cumulative distribution function (ECDF)
-        eCDF = torch.arange(1, n_sim + 1) / n_sim
+            # exact cdf
+            x = np.linspace(0, 1, 100)
+            w = w.sort().values
 
-        # calculate 95% confidence intervals for the eCDF
-        eps = np.sqrt(np.log(2 / 0.05) / (2 * n_sim))
-        eCDF_lower, eCDF_upper = eCDF - eps, eCDF + eps
+            fig.add_subplot(1, dim, j+1)
+            if not ecdf_diff:
+                # plot eCDF and true CDF values
+                plt.step(w, eCDF, lw=1)
+                plt.plot(x, x, 'k--', lw=1)
+                # plot 95% confidence bands
+                plt.fill_between(w, eCDF_lower, eCDF_upper, color='red', alpha=0.2)
+                plt.ylabel(r'$F_{\omega}$')
+            else:
+                plt.step(w, eCDF - w, lw=1)
+                #plt.fill_between(w, eCDF_lower - w, eCDF_upper - w, color='red', alpha=0.1)
+                plt.ylabel(r'$F_{\omega} - \omega$')
 
-        # exact cdf
-        x = np.linspace(0, 1, 100)
-
-        # eCDF for mu
-        #===============
-        fig.add_subplot(121)
-
-        w = W[:,0].sort().values
-        if not ecdf_diff:
-            # plot eCDF and true CDF values
-            plt.step(w, eCDF, lw=1)
-            plt.plot(x, x, 'k--', lw=1)
-
-            # plot 95% confidence bands
-            plt.fill_between(w, eCDF_lower, eCDF_upper, color='red', alpha=0.2)
-
-            plt.ylabel(r'$F_{\omega}$')
+            plt.xlabel(r'$\omega$')
+            plt.title(labels[j])
         else:
-            plt.step(w, eCDF - w, lw=1)
-            #plt.fill_between(w, eCDF_lower - w, eCDF_upper - w, color='red', alpha=0.1)
-            plt.ylabel(r'$F_{\omega} - \omega$')
+            #========================================
+            # plot histograms
+            #========================================
+            fig.add_subplot(1, dim, j + 1)
+            plt.hist(w, bins=25, density=True, alpha=.6)
+            plt.title(labels[j])
 
-        plt.xlabel(r'$\omega$')
-        plt.title(r'$\mu$')
-
-        # eCDF plot for sigma2
-        #======================
-        fig.add_subplot(122)
-
-        w = W[:,1].sort().values
-        if not ecdf_diff:
-            plt.step(w, eCDF, lw=1)
-            plt.plot(x, x, 'k--', lw=1)
-            # plot 95% confidence bands
-            plt.fill_between(w, eCDF_lower, eCDF_upper, color='red', alpha=0.2)
-
-            plt.ylabel(r'$F_{\omega}$')
-        else:
-            plt.step(w, eCDF - w, lw=1)
-            # plot 95% confidence bands
-            #plt.fill_between(w, eCDF_lower - w, eCDF_upper - w, color='red', alpha=0.1)
-            plt.ylabel(r'$F_{\omega} - \omega$')
-
-        plt.xlabel(r'$\omega$')
-        plt.title(r'$\log(\sigma2)$')
-
-        plt.tight_layout()
-    else:
-        #========================================
-        # plot histograms
-        #========================================
-        fig = plt.figure(figsize=(8, 3), dpi=200)
-
-        # mu
-        fig.add_subplot(1,2,1)
-        plt.hist(W[...,0], bins=20, density=True, alpha=.6, label=r'$F^{-1}(\mu)$')
-        plt.title(r'$\mu$')
-        plt.legend(fontsize=7,  markerscale=.5)
-
-        # log(sigma2)
-        fig.add_subplot(1,2,2)
-        plt.hist(W[...,1], bins=20, density=True, alpha=.6, label=r'$F^{-1}(\log(\sigma^2))$')
-        plt.title(r'$\sigma^2$')
-        plt.legend(fontsize=7,  markerscale=.5)
-
-        plt.title(r'$\log(\sigma^2)$')
-        plt.legend(fontsize=7,  markerscale=.5)
-
+    plt.tight_layout()
+        
     
     return fig
